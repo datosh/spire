@@ -36,3 +36,5 @@ tools/spire-plugingen/spire-plugingen
 # oci artifacts
 *-image.tar
 oci/
+
+go-sev-guest

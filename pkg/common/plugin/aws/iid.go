@@ -25,3 +25,12 @@ type IIDAttestationData struct {
 func AttestationStepError(step string, cause error) error {
 	return iidError.New("attempted attestation but an error occurred %s: %w", step, cause)
 }
+
+type ChallengeRequest struct {
+	Nonce []byte
+}
+
+type ChallengeResponse struct {
+	Report    []byte
+	CertChain []byte
+}

@@ -11,7 +11,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"math"
+	"net/http"
 	"os"
 	"regexp"
 	"sort"
@@ -27,6 +29,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	iamtypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/fullsailor/pkcs7"
+	"github.com/google/go-sev-guest/abi"
+	"github.com/google/go-sev-guest/proto/sevsnp"
+	"github.com/google/go-sev-guest/verify"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	"github.com/spiffe/go-spiffe/v2/spiffeid"
@@ -164,7 +169,6 @@ func (p *IIDAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 		InstanceIds: []string{attestationData.InstanceID},
 		Filters:     instanceFilters,
 	})
-
 	if err != nil {
 		return status.Errorf(codes.Internal, "failed to describe instance: %v", err)
 	}
@@ -178,7 +182,7 @@ func (p *IIDAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 	// is a potential DoS vector.
 	shouldCheckBlockDevice := !inTrustAcctList && !c.SkipBlockDevice
 	var instance ec2types.Instance
-	var tags = make(instanceTags)
+	tags := make(instanceTags)
 	if strings.Contains(c.AgentPathTemplate, ".Tags") || shouldCheckBlockDevice {
 		var err error
 		instance, err = p.getEC2Instance(instancesDesc)
@@ -204,20 +208,170 @@ func (p *IIDAttestorPlugin) Attest(stream nodeattestorv1.NodeAttestor_AttestServ
 		return err
 	}
 
+	// TODO: Make this randomly generated
+	nonce := []byte{0x01, 0x02, 0x03, 0x04}
+	challenge, err := json.Marshal(caws.ChallengeRequest{
+		Nonce: nonce,
+	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to marshal challenge: %v", err)
+	}
+
+	err = stream.Send(&nodeattestorv1.AttestResponse{
+		Response: &nodeattestorv1.AttestResponse_Challenge{
+			Challenge: challenge,
+		},
+	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to send challenge: %v", err)
+	}
+
+	responseReq, err := stream.Recv()
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to receive challenge response: %v", err)
+	}
+
+	challengeResponse := &caws.ChallengeResponse{}
+	if err = json.Unmarshal(responseReq.GetChallengeResponse(), challengeResponse); err != nil {
+		return status.Errorf(codes.Internal, "unable to unmarshal challenge response: %v", err)
+	}
+
+	err = verifyReport(challengeResponse.Report, challengeResponse.CertChain, nonce)
+	if err != nil {
+		return status.Errorf(codes.Internal, "verifying attestation report: %v", err)
+	}
+
 	selectorValues, err := p.resolveSelectors(stream.Context(), instancesDesc, attestationData, awsClient)
 	if err != nil {
 		return err
 	}
 
+	report, err := abi.ReportToProto(challengeResponse.Report)
+	if err != nil {
+		return status.Errorf(codes.Internal, "converting report: %v", err)
+	}
+
+	selectorValues = append(
+		selectorValues,
+		fmt.Sprintf("aws_iid:measurements:%x", report.Measurement),
+	)
+
 	return stream.Send(&nodeattestorv1.AttestResponse{
 		Response: &nodeattestorv1.AttestResponse_AgentAttributes{
 			AgentAttributes: &nodeattestorv1.AgentAttributes{
 				CanReattest:    false,
-				SpiffeId:       agentID.String(),
+				SpiffeId:       agentID.String() + fmt.Sprintf("%d%d%d%d", nonce[0], nonce[1], nonce[2], nonce[3]),
 				SelectorValues: selectorValues,
 			},
 		},
 	})
+}
+
+// verifyReport based on ARK -> ASK -> VLEK -> report
+func verifyReport(rawReport, certChain, nonce []byte) error {
+	report, err := abi.ReportToProto(rawReport)
+	if err != nil {
+		return fmt.Errorf("converting report: %w", err)
+	}
+
+	vlek, err := getVLEKFromCertChain(certChain)
+	if err != nil {
+		return fmt.Errorf("getting VLEK from cert chain: %w", err)
+	}
+
+	ask, ark, err := downloadAskArk()
+	if err != nil {
+		return fmt.Errorf("downloading ASK & ARK: %w", err)
+	}
+
+	err = verifyCertChain(ask, ark, vlek, report)
+	if err != nil {
+		return fmt.Errorf("downloading cert chain: %w", err)
+	}
+
+	err = checkNonce(nonce, report)
+	if err != nil {
+		return fmt.Errorf("checking nonce: %w", err)
+	}
+
+	return nil
+}
+
+func checkNonce(nonce []byte, report *sevsnp.Report) error {
+	if len(report.ReportData) != 64 {
+		return fmt.Errorf("report data should be 64 byte, but is %d byte", len(report.ReportData))
+	}
+
+	for i := 0; i < len(nonce); i++ {
+		if nonce[i] != report.ReportData[i] {
+			return fmt.Errorf("nonce byte %d does not match %x != %x", i, nonce[i], report.ReportData[i])
+		}
+	}
+
+	return nil
+}
+
+func verifyCertChain(ask, ark, vlek *x509.Certificate, report *sevsnp.Report) error {
+	if err := ask.CheckSignatureFrom(ark); err != nil {
+		return fmt.Errorf("verifying ARK -> ASK: %w", err)
+	}
+	if err := vlek.CheckSignatureFrom(ask); err != nil {
+		return fmt.Errorf("verifying ASK -> VLEK: %w", err)
+	}
+	if err := verify.SnpProtoReportSignature(report, vlek); err != nil {
+		return fmt.Errorf("verifying VLEK -> report: %w", err)
+	}
+
+	return nil
+}
+
+func getVLEKFromCertChain(certChain []byte) (*x509.Certificate, error) {
+	certs := new(abi.CertTable)
+	if err := certs.Unmarshal(certChain); err != nil {
+		return nil, fmt.Errorf("unmarshaling cert chain: %w", err)
+	}
+	vlekCertRaw, err := certs.GetByGUIDString(abi.VlekGUID)
+	if err != nil {
+		return nil, fmt.Errorf("retrieving VLEK: %w", err)
+	}
+	vlek, err := x509.ParseCertificate(vlekCertRaw)
+	if err != nil {
+		return nil, fmt.Errorf("parsing VLEK: %w", err)
+	}
+
+	return vlek, nil
+}
+
+func downloadAskArk() (*x509.Certificate, *x509.Certificate, error) {
+	resp, err := http.Get("https://kdsintf.amd.com/vlek/v1/Milan/cert_chain")
+	if err != nil {
+		return nil, nil, fmt.Errorf("downloading cert chain: %w", err)
+	}
+	defer resp.Body.Close()
+	cert_chain, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("reading cert chain: %w", err)
+	}
+
+	askPEM, rest := pem.Decode(cert_chain)
+	if askPEM == nil {
+		return nil, nil, fmt.Errorf("decoding ASK: %w", err)
+	}
+	arkPEM, rest := pem.Decode(rest)
+	if arkPEM == nil || len(rest) != 0 {
+		return nil, nil, fmt.Errorf("decoding ARK: %w", err)
+	}
+
+	ask, err := x509.ParseCertificate(askPEM.Bytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing ASK: %w", err)
+	}
+	ark, err := x509.ParseCertificate(arkPEM.Bytes)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parsing ARK: %w", err)
+	}
+
+	return ask, ark, nil
 }
 
 // Configure configures the IIDAttestorPlugin.

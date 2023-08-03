@@ -3,12 +3,14 @@ package awsiid
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/feature/ec2/imds"
+	"github.com/google/go-sev-guest/client"
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/hcl"
 	nodeattestorv1 "github.com/spiffe/spire-plugin-sdk/proto/spire/plugin/agent/nodeattestor/v1"
@@ -77,11 +79,62 @@ func (p *IIDAttestorPlugin) AidAttestation(stream nodeattestorv1.NodeAttestor_Ai
 		return status.Errorf(codes.Internal, "unable to marshal attestation data: %v", err)
 	}
 
-	return stream.Send(&nodeattestorv1.PayloadOrChallengeResponse{
+	err = stream.Send(&nodeattestorv1.PayloadOrChallengeResponse{
 		Data: &nodeattestorv1.PayloadOrChallengeResponse_Payload{
 			Payload: respData,
 		},
 	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to send payload to server: %v", err)
+	}
+
+	marshalledChallenges, err := stream.Recv()
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to receive challenge from server: %v", err)
+	}
+
+	challenge := &caws.ChallengeRequest{}
+	if err = json.Unmarshal(marshalledChallenges.Challenge, challenge); err != nil {
+		return status.Errorf(codes.Internal, "unable to unmarshal challenge: %v", err)
+	}
+
+	var nonceArray [64]byte
+	for i := 0; i < len(challenge.Nonce); i++ {
+		nonceArray[i] = challenge.Nonce[i]
+	}
+
+	report, certChain, err := generateReport(nonceArray)
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to generate report: %v", err)
+	}
+
+	marshalledChallengeResp, err := json.Marshal(caws.ChallengeResponse{
+		Report:    report,
+		CertChain: certChain,
+	})
+	if err != nil {
+		return status.Errorf(codes.Internal, "unable to marshal challenge response: %v", err)
+	}
+
+	return stream.Send(&nodeattestorv1.PayloadOrChallengeResponse{
+		Data: &nodeattestorv1.PayloadOrChallengeResponse_ChallengeResponse{
+			ChallengeResponse: marshalledChallengeResp,
+		},
+	})
+}
+
+func generateReport(nonce [64]byte) ([]byte, []byte, error) {
+	dev, err := client.OpenDevice()
+	if err != nil {
+		return nil, nil, fmt.Errorf("unable to open device: %w", err)
+	}
+	defer dev.Close()
+
+	report, certChain, err := client.GetRawExtendedReport(dev, nonce)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get extended report: %w", err)
+	}
+	return report, certChain, nil
 }
 
 func fetchMetadata(ctx context.Context, endpoint string) (*caws.IIDAttestationData, error) {
