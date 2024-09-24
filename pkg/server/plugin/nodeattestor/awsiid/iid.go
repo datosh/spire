@@ -286,7 +286,7 @@ func verifyReport(rawReport, certChain, nonce []byte) error {
 
 	err = verifyCertChain(ask, ark, vlek, report)
 	if err != nil {
-		return fmt.Errorf("downloading cert chain: %w", err)
+		return fmt.Errorf("verifying cert chain: %w", err)
 	}
 
 	err = checkNonce(nonce, report)
