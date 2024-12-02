@@ -38,7 +38,7 @@ require (
 	github.com/golang/protobuf v1.5.3
 	github.com/google/go-cmp v0.5.9
 	github.com/google/go-containerregistry v0.15.2
-	github.com/google/go-sev-guest v0.11.1
+	github.com/google/go-sev-guest v0.11.2-0.20241122022416-97a55186df28
 	github.com/google/go-tpm v0.9.0
 	github.com/google/go-tpm-tools v0.4.0
 	github.com/googleapis/gax-go/v2 v2.12.0
@@ -200,7 +200,7 @@ require (
 	github.com/google/logger v1.1.1 // indirect
 	github.com/google/pprof v0.0.0-20221103000818-d260c55eee4c // indirect
 	github.com/google/s2a-go v0.1.4 // indirect
-	github.com/google/uuid v1.3.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.2.5 // indirect
 	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/hashicorp/errwrap v1.1.0 // indirect
@@ -249,7 +249,6 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0-rc4 // indirect
 	github.com/opentracing/opentracing-go v1.2.0 // indirect
-	github.com/pborman/uuid v1.2.1 // indirect
 	github.com/pelletier/go-toml/v2 v2.0.8 // indirect
 	github.com/pkg/browser v0.0.0-20210911075715-681adbf594b8 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
